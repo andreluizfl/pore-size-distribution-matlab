@@ -63,17 +63,7 @@ if useParallel
         if hasParallel
             pool = gcp('nocreate');  % Verifica se já existe uma pool
             if isempty(pool)
-                try
-                    % Tenta criar uma pool baseada em threads
-                    parpool('threads');
-                catch
-                    % Caso falhe, tenta usar a 'local' (process-based)
-                    try
-                        parpool('local');
-                    catch
-                        % Nenhuma pool pôde ser criada — segue sem paralelismo
-                    end
-                end
+				parpool('local');
                 pool = gcp('nocreate');  % Atualiza a referência da pool
             end
             useParallel = ~isempty(pool);
