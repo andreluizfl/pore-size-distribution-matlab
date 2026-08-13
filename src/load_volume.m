@@ -1,4 +1,4 @@
-function C = load_volume(imgDir, extType, volumetricSize, binThreshold, useParallel)
+function C = load_volume2(imgDir, extType, volumetricSize, binThreshold, useParallel)
 % LOAD_VOLUME  Read an image stack and produce a binary 3D volume.
 %
 %   C = LOAD_VOLUME(imgDir)
@@ -6,48 +6,26 @@ function C = load_volume(imgDir, extType, volumetricSize, binThreshold, useParal
 %
 % INPUTS:
 %   imgDir         - (char) path to the folder containing the image stack.
-%                     A path separator at the end is optional.
 %   extType        - (char, optional) image extension to search for,
 %                     e.g. '.bmp' (default), '.tif', '.png'.
 %   volumetricSize - (optional) defines the sub-volume to read. Accepts:
 %                     [] (default)         -> full image extents and all slices
 %                     string or char 'fit' -> automatically fits a centered cubic volume 
-%                     whose side length equals the smallest image dimension 
 %                     scalar N             -> NxNxN volume starting at (1,1,1)
-%                     3x2 matrix [x1 x2; y1 y2; z1 z2] -> explicit ranges
+%                     3x2 matrix           -> explicit ranges
 %   binThreshold   - (numeric, optional) binarization threshold.
-%                     -1 (default) => compute global Otsu threshold from the
-%                     entire loaded volume (intensity normalized to [0,1]).
+%                     -1 (default) => compute global Otsu threshold via sampling.
 %                     Otherwise use the provided numeric threshold (in [0,1]).
-%   useParallel     - (logical, optional) request parallel processing.
-%                     If omitted or empty, true is assumed and the function
-%                     will attempt to use a parpool if available. If no
-%                     parallel pool can be created, the function falls back
-%                     to serial processing.
+%   useParallel    - (logical, optional) request parallel processing.
 %
 % OUTPUT:
-%   C - logical 3D array (rows x cols x slices) containing the binary
-%       pore mask (true => pore / foreground).
+%   C - logical 3D array (rows x cols x slices) containing the binary pore mask.
 %
-% NOTES & IMPLEMENTATION DETAILS:
-%   - All input images must share identical dimensions. The function checks
-%     and throws an error if a mismatch is detected.
-%   - Images read as RGB will be converted to grayscale via rgb2gray.
-%   - Integer images (uint8, uint16) are normalized to [0,1] prior to
-%     Otsu thresholding. Floating point images are left as-is.
-%   - When binThreshold == -1 the function computes a global Otsu level
-%     using graythresh on the flattened normalized intensities of the
-%     loaded volume.
-%   - The function uses parfor to parallelize both image reading and
-%     per-slice binarization when a parallel pool is available and
-%     useParallel==true.
-%
-% EXAMPLE:
-%   C = load_volume('data/images', '.tif', [], -1, true);
-%
-% Author: adapted and modularized
-% Date:   (no date hard-coded here)
-%
+% OTIMIZAÇÕES APLICADAS:
+%   - Remoção de alocação matriz em ponto flutuante (single), economizando memória.
+%   - Amostragem estratificada para cálculo do limiar de Otsu global.
+%   - Leitura e binarização fundidas em um único laço de I/O.
+%   - Detecção inteligente (Bypass) para imagens que já são nativamente lógicas (binárias).
 
 % -------------------- Defaults and input normalization --------------------
 if nargin < 2 || isempty(extType)
@@ -111,7 +89,7 @@ if isempty(volumetricSize)
     rangeY = [1 orig_rows];
     rangeZ = [1 num_images];
 elseif isstring(volumetricSize) || ischar(volumetricSize)
-    if  isequal(volumetricSize,'fit')
+    if  string(volumetricSize) == "fit"
         N = min([orig_rows,orig_cols,num_images]);
         diff_x = round((orig_cols-N)/2);
         diff_y = round((orig_rows-N)/2);
@@ -120,7 +98,7 @@ elseif isstring(volumetricSize) || ischar(volumetricSize)
         rangeY = [diff_y+1 diff_y+N];
         rangeZ = [diff_z+1 diff_z+N];
     else
-        error('Invalid volumetricSize. Provide a invalid name. Must be "fit"');
+        error("Invalid volumetricSize. Provide a invalid name. Must be 'fit'");
     end
 elseif isscalar(volumetricSize)
     N = round(volumetricSize);
@@ -155,22 +133,42 @@ if useParallel
     try
         hasParallel = license('test', 'Distrib_Computing_Toolbox');
         if hasParallel
-            pool = gcp('nocreate');  % Verifica se já existe uma pool
+            % Determine if the file extension is safe for thread-based reading.
+            % TIFF and GIF files use underlying C/C++ libraries that are not thread-safe.
+            isThreadSafeIO = ~contains(extType, {'tif', 'tiff', 'gif'}, 'IgnoreCase', true);
+            
+            pool = gcp('nocreate');
             if isempty(pool)
-                try
-                    % Tenta criar uma pool baseada em threads
-                    parpool('threads');
-                catch
-                    % Caso falhe, tenta usar a 'local' (process-based)
+                if isThreadSafeIO
+                    % For safe formats (BMP, PNG, JPG), try threads first to save RAM
+                    try
+                        parpool('threads');
+                    catch
+                        try
+                            parpool('local');
+                        catch
+                        end
+                    end
+                else
+                    % For unsafe formats (TIFF), skip threads and go straight to process-based pool
                     try
                         parpool('local');
                     catch
-                        % Nenhuma pool pôde ser criada — segue sem paralelismo
                     end
                 end
-                pool = gcp('nocreate');  % Atualiza a referência da pool
+                pool = gcp('nocreate'); % Update pool reference
             end
-            useParallel = ~isempty(pool);
+            
+            % Safety handler: what if the user already had a thread pool open 
+            % in the session before calling this function?
+            if ~isempty(pool) && isa(pool, 'parallel.ThreadPool') && ~isThreadSafeIO
+                warning(['Uma pool baseada em threads ja esta ativa, mas a extensao ' ...
+                         '"%s" nao e thread-safe. O paralelismo sera desativado nesta ' ...
+                         'execucao para evitar falhas no imread.'], extType);
+                useParallel = false;
+            else
+                useParallel = ~isempty(pool);
+            end
         else
             useParallel = false;
         end
@@ -178,55 +176,70 @@ if useParallel
         useParallel = false;
     end
 end
+% -------------------- Compute global Otsu threshold (Optimized via Sampling) --------
+% Check if the first image is already natively logical (e.g., pure 1-bit BMP)
+I_first_test = imread([imgDir files(imgs_range(1)).name]);
+isAlreadyLogical = islogical(I_first_test);
 
-% -------------------- Load images into a single-precision volume ---------
-% We'll normalize integer types to [0,1] for consistent Otsu behavior.
-grayVolume = zeros(rows, cols, num_imgs, 'single');
-for ii = 1:num_imgs
-    idxFile = imgs_range(ii);
-    I = imread([imgDir files(idxFile).name]);
-    if ndims(I) == 3
-        I = rgb2gray(I);
+if isAlreadyLogical
+    % If it is already binary, we do not need Otsu thresholding
+    globalLevel = 0.5; % Valor de segurança, não será processado no imbinarize
+elseif binThreshold == -1
+    % Read samples distributed across the volume instead of all slices to save I/O and RAM
+    num_samples = min(num_imgs, 25); 
+    sample_indices = round(linspace(1, num_imgs, num_samples));
+    sample_pixels = cell(num_samples, 1);
+    
+    for s = 1:num_samples
+        idxFile = imgs_range(sample_indices(s));
+        I = imread([imgDir files(idxFile).name]);
+        if ndims(I) == 3
+            I = rgb2gray(I);
+        end
+        I = I(rows_range, cols_range);
+        sample_pixels{s} = I(:); % Keeps original type (uint8 or uint16)
     end
-    I = I(rows_range, cols_range);
-    I_single = single(I);
-    % This normalization was writen for safety, but its kind redundant
-    % with graythresh and imbinarize internal operations
-    % origClass = class(I);
-    % switch origClass
-    %     case 'uint8'
-    %         I_single = I_single / 255;
-    %     case 'uint16'
-    %         I_single = I_single / 65535;
-    %     otherwise
-    % end
-    grayVolume(:, :, ii) = I_single;
-end
-
-
-% -------------------- Compute global Otsu threshold if requested ---------
-if binThreshold == -1
-    minVal = min(grayVolume(:));
-    maxVal = max(grayVolume(:));
-    if maxVal > minVal
-        normalizedVol = (grayVolume - minVal) / (maxVal - minVal);
-    else
-        normalizedVol = grayVolume;
-    end
-    globalLevel = graythresh(normalizedVol(:));
+    
+    sampled_vol = cell2mat(sample_pixels);
+    globalLevel = graythresh(sampled_vol);
 else
     globalLevel = binThreshold;
 end
 
-% -------------------- Binarize the volume -------------------------------
+% -------------------- Single-Pass Read and Binarize ----------------------
+% Pre-allocate purely logical matrix.
 C = false(rows, cols, num_imgs);
+
 if useParallel
     parfor ii = 1:num_imgs
-        C(:, :, ii) = imbinarize(grayVolume(:, :, ii), globalLevel);
+        idxFile = imgs_range(ii);
+        I = imread([imgDir files(idxFile).name]);
+        if ndims(I) == 3
+            I = rgb2gray(I);
+        end
+        I = I(rows_range, cols_range);
+        
+        % Direct assignment if already binary; otherwise, binarize
+        if islogical(I)
+            C(:, :, ii) = I;
+        else
+            C(:, :, ii) = imbinarize(I, globalLevel);
+        end
     end
 else
     for ii = 1:num_imgs
-        C(:, :, ii) = imbinarize(grayVolume(:, :, ii), globalLevel);
+        idxFile = imgs_range(ii);
+        I = imread([imgDir files(idxFile).name]);
+        if ndims(I) == 3
+            I = rgb2gray(I);
+        end
+        I = I(rows_range, cols_range);
+        
+        if islogical(I)
+            C(:, :, ii) = I;
+        else
+            C(:, :, ii) = imbinarize(I, globalLevel);
+        end
     end
 end
 
