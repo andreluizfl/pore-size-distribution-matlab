@@ -1,4 +1,4 @@
-function C = load_volume2(imgDir, extType, volumetricSize, binThreshold, useParallel)
+function C = load_volume(imgDir, extType, volumetricSize, binThreshold, useParallel)
 % LOAD_VOLUME  Read an image stack and produce a binary 3D volume.
 %
 %   C = LOAD_VOLUME(imgDir)
@@ -7,7 +7,7 @@ function C = load_volume2(imgDir, extType, volumetricSize, binThreshold, usePara
 % INPUTS:
 %   imgDir         - (char) path to the folder containing the image stack.
 %   extType        - (char, optional) image extension to search for,
-%                     e.g. '.bmp' (default), '.tif', '.png'.
+%                     e.g., '.bmp' (default), '.tif', '.png'.
 %   volumetricSize - (optional) defines the sub-volume to read. Accepts:
 %                     [] (default)         -> full image extents and all slices
 %                     string or char 'fit' -> automatically fits a centered cubic volume 
@@ -15,17 +15,19 @@ function C = load_volume2(imgDir, extType, volumetricSize, binThreshold, usePara
 %                     3x2 matrix           -> explicit ranges
 %   binThreshold   - (numeric, optional) binarization threshold.
 %                     -1 (default) => compute global Otsu threshold via sampling.
-%                     Otherwise use the provided numeric threshold (in [0,1]).
+%                     Otherwise, use the provided numeric threshold (in [0,1]).
 %   useParallel    - (logical, optional) request parallel processing.
 %
 % OUTPUT:
 %   C - logical 3D array (rows x cols x slices) containing the binary pore mask.
 %
-% OTIMIZAÇÕES APLICADAS:
-%   - Remoção de alocação matriz em ponto flutuante (single), economizando memória.
-%   - Amostragem estratificada para cálculo do limiar de Otsu global.
-%   - Leitura e binarização fundidas em um único laço de I/O.
-%   - Detecção inteligente (Bypass) para imagens que já são nativamente lógicas (binárias).
+% APPLIED OPTIMIZATIONS:
+%   - Removed single-precision floating-point matrix allocation, saving memory.
+%   - Stratified sampling for global Otsu threshold calculation.
+%   - Read and binarize steps merged into a single I/O loop.
+%   - Intelligent bypass detection for images that are natively logical (binary).
+%   - Thread-safe I/O check: Preemptively prioritizes 'local' pool for TIFF/GIF formats.
+%   - Enforced type consistency before cell2mat concatenation.
 
 % -------------------- Defaults and input normalization --------------------
 if nargin < 2 || isempty(extType)
@@ -51,54 +53,54 @@ end
 
 % -------------------- Find and sort files --------------------------------
 files = dir([imgDir '*' extType]);
-files = files(~[files.isdir]);  % remove directories
+files = files(~[files.isdir]);  % Remove directories
 
 if isempty(files)
     error('No image files found in the specified directory: %s', imgDir);
 end
 
-% Numeric-aware sorting: extract trailing number groups and sort by last group
-file_numbers = zeros(1, numel(files));
+% Numeric-aware sorting: extract trailing number groups and sort by the last group
+fileNumbers = zeros(1, numel(files));
 for ff = 1:numel(files)
     nums = regexp(files(ff).name, '\d+', 'match');
     if isempty(nums)
-        file_numbers(ff) = 0;
+        fileNumbers(ff) = 0;
     else
-        file_numbers(ff) = str2double(nums{end});
+        fileNumbers(ff) = str2double(nums{end});
     end
 end
-[~, sort_idx] = sort(file_numbers);
-files = files(sort_idx);
-num_images = numel(files);
+[~, sortIdx] = sort(fileNumbers);
+files = files(sortIdx);
+numImages = numel(files);
 
 % -------------------- Validate consistent image geometry -----------------
-first_info = imfinfo([imgDir files(1).name]);
-orig_rows = first_info.Height;
-orig_cols = first_info.Width;
+firstInfo = imfinfo([imgDir files(1).name]);
+origRows = firstInfo.Height;
+origCols = firstInfo.Width;
 
 for ff = 2:numel(files)
-    info_ff = imfinfo([imgDir files(ff).name]);
-    if info_ff.Height ~= orig_rows || info_ff.Width ~= orig_cols
+    infoFf = imfinfo([imgDir files(ff).name]);
+    if infoFf.Height ~= origRows || infoFf.Width ~= origCols
         error('All images must have identical dimensions. File "%s" differs.', files(ff).name);
     end
 end
 
 % -------------------- Determine volumetric ranges ------------------------
 if isempty(volumetricSize)
-    rangeX = [1 orig_cols];
-    rangeY = [1 orig_rows];
-    rangeZ = [1 num_images];
+    rangeX = [1 origCols];
+    rangeY = [1 origRows];
+    rangeZ = [1 numImages];
 elseif isstring(volumetricSize) || ischar(volumetricSize)
     if  string(volumetricSize) == "fit"
-        N = min([orig_rows,orig_cols,num_images]);
-        diff_x = round((orig_cols-N)/2);
-        diff_y = round((orig_rows-N)/2);
-        diff_z = round((num_images-N)/2);
-        rangeX = [diff_x+1 diff_x+N];
-        rangeY = [diff_y+1 diff_y+N];
-        rangeZ = [diff_z+1 diff_z+N];
+        N = min([origRows, origCols, numImages]);
+        diffX = round((origCols - N) / 2);
+        diffY = round((origRows - N) / 2);
+        diffZ = round((numImages - N) / 2);
+        rangeX = [diffX + 1, diffX + N];
+        rangeY = [diffY + 1, diffY + N];
+        rangeZ = [diffZ + 1, diffZ + N];
     else
-        error("Invalid volumetricSize. Provide a invalid name. Must be 'fit'");
+        error("Invalid volumetricSize name. Must be 'fit'.");
     end
 elseif isscalar(volumetricSize)
     N = round(volumetricSize);
@@ -113,23 +115,25 @@ else
 end
 
 % Clamp user ranges to available image dimensions / slice count
-rangeX(2) = min(rangeX(2), orig_cols);
-rangeY(2) = min(rangeY(2), orig_rows);
-rangeZ(2) = min(rangeZ(2), num_images);
+rangeX(2) = min(rangeX(2), origCols);
+rangeY(2) = min(rangeY(2), origRows);
+rangeZ(2) = min(rangeZ(2), numImages);
 
-rows_range = rangeY(1):rangeY(2);
-cols_range = rangeX(1):rangeX(2);
-imgs_range = rangeZ(1):rangeZ(2);
+rowsRange = rangeY(1):rangeY(2);
+colsRange = rangeX(1):rangeX(2);
+imgsRange = rangeZ(1):rangeZ(2);
 
-rows = numel(rows_range);
-cols = numel(cols_range);
-num_imgs = numel(imgs_range);
+numRows = numel(rowsRange);
+numCols = numel(colsRange);
+numImgs = numel(imgsRange);
 
 fprintf('Using volume range: X=[%d %d], Y=[%d %d], Z=[%d %d]\n', ...
     rangeX(1), rangeX(2), rangeY(1), rangeY(2), rangeZ(1), rangeZ(2));
 
 % -------------------- Parallel setup (best-effort) -----------------------
 if useParallel
+    ncores = feature('numcores');
+    eff_ncores = floor(ncores*0.9); %avoid overhead and RAM excess
     try
         hasParallel = license('test', 'Distrib_Computing_Toolbox');
         if hasParallel
@@ -142,17 +146,17 @@ if useParallel
                 if isThreadSafeIO
                     % For safe formats (BMP, PNG, JPG), try threads first to save RAM
                     try
-                        parpool('threads');
+                        parpool('threads',eff_ncores);
                     catch
                         try
-                            parpool('local');
+                            parpool('local',eff_ncores);
                         catch
                         end
                     end
                 else
                     % For unsafe formats (TIFF), skip threads and go straight to process-based pool
                     try
-                        parpool('local');
+                        parpool('local',eff_ncores);
                     catch
                     end
                 end
@@ -162,9 +166,9 @@ if useParallel
             % Safety handler: what if the user already had a thread pool open 
             % in the session before calling this function?
             if ~isempty(pool) && isa(pool, 'parallel.ThreadPool') && ~isThreadSafeIO
-                warning(['Uma pool baseada em threads ja esta ativa, mas a extensao ' ...
-                         '"%s" nao e thread-safe. O paralelismo sera desativado nesta ' ...
-                         'execucao para evitar falhas no imread.'], extType);
+                warning(['A thread-based pool is already active, but the extension ' ...
+                         '"%s" is not thread-safe. Parallelism will be disabled for this ' ...
+                         'execution to prevent imread failures.'], extType);
                 useParallel = false;
             else
                 useParallel = ~isempty(pool);
@@ -176,48 +180,62 @@ if useParallel
         useParallel = false;
     end
 end
+
 % -------------------- Compute global Otsu threshold (Optimized via Sampling) --------
 % Check if the first image is already natively logical (e.g., pure 1-bit BMP)
-I_first_test = imread([imgDir files(imgs_range(1)).name]);
-isAlreadyLogical = islogical(I_first_test);
+firstImageTest = imread([imgDir files(imgsRange(1)).name]);
+isAlreadyLogical = islogical(firstImageTest);
 
 if isAlreadyLogical
     % If it is already binary, we do not need Otsu thresholding
-    globalLevel = 0.5; % Valor de segurança, não será processado no imbinarize
+    globalLevel = 0.5; % Safety dummy value, will not be processed in imbinarize
 elseif binThreshold == -1
     % Read samples distributed across the volume instead of all slices to save I/O and RAM
-    num_samples = min(num_imgs, 25); 
-    sample_indices = round(linspace(1, num_imgs, num_samples));
-    sample_pixels = cell(num_samples, 1);
+    numSamples = min(numImgs, 25); 
+    sampleIndices = round(linspace(1, numImgs, numSamples));
+    samplePixels = cell(numSamples, 1);
     
-    for s = 1:num_samples
-        idxFile = imgs_range(sample_indices(s));
+    % Define a reference data class based on the first sample to prevent cell2mat errors
+    I_ref = imread([imgDir files(imgsRange(sampleIndices(1))).name]);
+    if ndims(I_ref) == 3
+        I_ref = rgb2gray(I_ref);
+    end
+    refClass = class(I_ref);
+    
+    for s = 1:numSamples
+        idxFile = imgsRange(sampleIndices(s));
         I = imread([imgDir files(idxFile).name]);
         if ndims(I) == 3
             I = rgb2gray(I);
         end
-        I = I(rows_range, cols_range);
-        sample_pixels{s} = I(:); % Keeps original type (uint8 or uint16)
+        I = I(rowsRange, colsRange);
+        
+        % Force data type consistency before appending to cell array
+        if ~isa(I, refClass)
+            I = cast(I, refClass);
+        end
+        
+        samplePixels{s} = I(:); 
     end
     
-    sampled_vol = cell2mat(sample_pixels);
-    globalLevel = graythresh(sampled_vol);
+    sampledVol = cell2mat(samplePixels);
+    globalLevel = graythresh(sampledVol);
 else
     globalLevel = binThreshold;
 end
 
 % -------------------- Single-Pass Read and Binarize ----------------------
 % Pre-allocate purely logical matrix.
-C = false(rows, cols, num_imgs);
+C = false(numRows, numCols, numImgs);
 
 if useParallel
-    parfor ii = 1:num_imgs
-        idxFile = imgs_range(ii);
+    parfor ii = 1:numImgs
+        idxFile = imgsRange(ii);
         I = imread([imgDir files(idxFile).name]);
         if ndims(I) == 3
             I = rgb2gray(I);
         end
-        I = I(rows_range, cols_range);
+        I = I(rowsRange, colsRange);
         
         % Direct assignment if already binary; otherwise, binarize
         if islogical(I)
@@ -227,13 +245,13 @@ if useParallel
         end
     end
 else
-    for ii = 1:num_imgs
-        idxFile = imgs_range(ii);
+    for ii = 1:numImgs
+        idxFile = imgsRange(ii);
         I = imread([imgDir files(idxFile).name]);
         if ndims(I) == 3
             I = rgb2gray(I);
         end
-        I = I(rows_range, cols_range);
+        I = I(rowsRange, colsRange);
         
         if islogical(I)
             C(:, :, ii) = I;

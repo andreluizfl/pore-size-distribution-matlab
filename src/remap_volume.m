@@ -10,7 +10,7 @@ function C_sub = remap_volume(C_full, subvolSpec, alignment)
 % ============================================================
 % INPUTS:
 %   C_full       : 3D matrix (logical or numeric), the original volume
-%   subvolSpec  : Specifies the size of the subvolume. Accepted forms:
+%   subvolSpec   : Specifies the size of the subvolume. Accepted forms:
 %                  - Scalar <1: proportional cube (same ratio X,Y,Z)
 %                  - 3-element vector <1: proportional per axis [X Y Z]
 %                  - Scalar >=1: absolute cube size (same for all axes)
@@ -28,16 +28,11 @@ function C_sub = remap_volume(C_full, subvolSpec, alignment)
 %   C_sub        : Extracted subvolume, same class as C_full
 %
 % ============================================================
-% NOTES:
-%   - Works for both logical and numeric volumes.
-%   - Fully backward-compatible with MATLAB < R2016b (strfind instead of contains).
-%   - Alignment strings can combine directions, e.g. "top-right-back".
+% OTIMIZAÇÕES APLICADAS:
+%   - Remoção completa do overhead de I/O da função 'verLessThan'.
+%   - Uso universal do 'strfind' nativo em C para compatibilidade imediata.
+%   - Tratamento seguro de matrizes com a 3ª dimensão colapsada.
 % ============================================================
-
-%% -------------------- Version detection --------------------
-% Determine if MATLAB version is legacy (<9.1 = R2016b)
-% Needed for backward-compatible string search
-isLegacy = verLessThan('matlab','9.1'); 
 
 %% -------------------- Input validation --------------------
 % Default alignment is "center" if not specified
@@ -45,16 +40,14 @@ if nargin < 3 || isempty(alignment)
     alignment = 'center';
 end
 
-% Ensure C_full is 3D
-dims = size(C_full);
-if numel(dims) < 3
-    error('C_full must be a 3D array.');
-end
+% Safe dimension extraction (avoids errors if Nz == 1)
+Nx_full = size(C_full, 2);  % X-axis (columns)
+Ny_full = size(C_full, 1);  % Y-axis (rows)
+Nz_full = size(C_full, 3);  % Z-axis (slices)
 
-% Store full volume dimensions for reference
-Nx_full = dims(2);  % X-axis (columns)
-Ny_full = dims(1);  % Y-axis (rows)
-Nz_full = dims(3);  % Z-axis (slices)
+if Nx_full == 0 || Ny_full == 0
+    error('C_full cannot be empty.');
+end
 
 %% -------------------- Determine extraction mode --------------------
 % Handle different forms of subvolSpec
@@ -107,24 +100,16 @@ Nz = min(Nz, Nz_full);
 % Lowercase for consistency
 alignment = lower(alignment);
 
-% Use strfind for legacy MATLAB, contains for newer versions
-if isLegacy
-    hasRight  = ~isempty(strfind(alignment,'right'));
-    hasLeft   = ~isempty(strfind(alignment,'left'));
-    hasTop    = ~isempty(strfind(alignment,'top'));
-    hasBottom = ~isempty(strfind(alignment,'bottom'));
-    hasCenter = ~isempty(strfind(alignment,'center')) || ~isempty(strfind(alignment,'c'));
-    hasFront  = ~isempty(strfind(alignment,'front'));
-    hasBack   = ~isempty(strfind(alignment,'back'));
-else
-    hasRight  = contains(alignment,'right');
-    hasLeft   = contains(alignment,'left');
-    hasTop    = contains(alignment,'top');
-    hasBottom = contains(alignment,'bottom');
-    hasCenter = contains(alignment,'center') || contains(alignment,'c');
-    hasFront  = contains(alignment,'front');
-    hasBack   = contains(alignment,'back');
-end
+% Unified fast string search.
+% strfind is implemented in C at the core MATLAB level and is fully
+% backward compatible, eliminating the need for slow verLessThan checks.
+hasRight  = ~isempty(strfind(alignment,'right'));
+hasLeft   = ~isempty(strfind(alignment,'left'));
+hasTop    = ~isempty(strfind(alignment,'top'));
+hasBottom = ~isempty(strfind(alignment,'bottom'));
+hasCenter = ~isempty(strfind(alignment,'center')) || ~isempty(strfind(alignment,'c'));
+hasFront  = ~isempty(strfind(alignment,'front'));
+hasBack   = ~isempty(strfind(alignment,'back'));
 
 %% -------------------- Compute start indices per axis --------------------
 % X-axis (columns)
