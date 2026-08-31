@@ -104,8 +104,8 @@ The figure compares average computation time for the two implementations analyzi
 
 | Version                | Description                    | Avg. Time (s) | Speedup |
 |------------------------|---------------------------------|---------------|----------|
-| Original (Yang 2009)   | Nested-loop implementation      | 58.07         | —        |
-| Optimized              | Vectorized + Bounding Box       | 0.48          | 120×     |
+| Original (Yang 2009)   | Nested-loop implementation      | 69.08         | —        |
+| Optimized              | Vectorized + Bounding Box       | 0.65         | 106×     |
 
 All benchmark data are available in [`results/ts.csv`](results/ts.csv)[cite: 5].
 
