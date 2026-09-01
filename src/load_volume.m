@@ -43,6 +43,9 @@ if nargin < 5 || isempty(useParallel)
     useParallel = true;
 end
 
+% Check compatibility for legacy binarization
+isLegacy = verLessThan('matlab', '9.0'); 
+
 % Ensure imgDir ends with filesep for safe concatenation
 if isempty(imgDir)
     error('imgDir must be a non-empty directory path.');
@@ -59,7 +62,7 @@ if isempty(files)
     error('No image files found in the specified directory: %s', imgDir);
 end
 
-% Numeric-aware sorting: extract trailing number groups and sort by the last group
+% Numeric-aware sorting
 fileNumbers = zeros(1, numel(files));
 for ff = 1:numel(files)
     nums = regexp(files(ff).name, '\d+', 'match');
@@ -114,7 +117,7 @@ else
     error('Invalid volumetricSize. Provide [] | scalar | 3x2 matrix.');
 end
 
-% Clamp user ranges to available image dimensions / slice count
+% Clamp user ranges
 rangeX(2) = min(rangeX(2), origCols);
 rangeY(2) = min(rangeY(2), origRows);
 rangeZ(2) = min(rangeZ(2), numImages);
@@ -131,44 +134,26 @@ fprintf('Using volume range: X=[%d %d], Y=[%d %d], Z=[%d %d]\n', ...
     rangeX(1), rangeX(2), rangeY(1), rangeY(2), rangeZ(1), rangeZ(2));
 
 % -------------------- Parallel setup (best-effort) -----------------------
+% (Mantido igual ao original, já está bem otimizado)
 if useParallel
     ncores = feature('numcores');
-    eff_ncores = floor(ncores*0.9); %avoid overhead and RAM excess
+    eff_ncores = floor(ncores*0.9);
     try
         hasParallel = license('test', 'Distrib_Computing_Toolbox');
         if hasParallel
-            % Determine if the file extension is safe for thread-based reading.
-            % TIFF and GIF files use underlying C/C++ libraries that are not thread-safe.
             isThreadSafeIO = ~contains(extType, {'tif', 'tiff', 'gif'}, 'IgnoreCase', true);
-            
             pool = gcp('nocreate');
             if isempty(pool)
                 if isThreadSafeIO
-                    % For safe formats (BMP, PNG, JPG), try threads first to save RAM
-                    try
-                        parpool('threads',eff_ncores);
-                    catch
-                        try
-                            parpool('local',eff_ncores);
-                        catch
-                        end
-                    end
+                    try parpool('threads',eff_ncores); catch, try parpool('local',eff_ncores); catch; end; end
                 else
-                    % For unsafe formats (TIFF), skip threads and go straight to process-based pool
-                    try
-                        parpool('local',eff_ncores);
-                    catch
-                    end
+                    try parpool('local',eff_ncores); catch; end
                 end
-                pool = gcp('nocreate'); % Update pool reference
+                pool = gcp('nocreate');
             end
-            
-            % Safety handler: what if the user already had a thread pool open 
-            % in the session before calling this function?
             if ~isempty(pool) && isa(pool, 'parallel.ThreadPool') && ~isThreadSafeIO
                 warning(['A thread-based pool is already active, but the extension ' ...
-                         '"%s" is not thread-safe. Parallelism will be disabled for this ' ...
-                         'execution to prevent imread failures.'], extType);
+                         '"%s" is not thread-safe. Parallelism will be disabled.'], extType);
                 useParallel = false;
             else
                 useParallel = ~isempty(pool);
@@ -181,82 +166,97 @@ if useParallel
     end
 end
 
-% -------------------- Compute global Otsu threshold (Optimized via Sampling) --------
-% Check if the first image is already natively logical (e.g., pure 1-bit BMP)
+% -------------------- Determine Binarization Strategy --------------------
 firstImageTest = imread([imgDir files(imgsRange(1)).name]);
-isAlreadyLogical = islogical(firstImageTest);
+if ndims(firstImageTest) == 3
+    firstImageTest = rgb2gray(firstImageTest);
+end
 
-if isAlreadyLogical
-    % If it is already binary, we do not need Otsu thresholding
-    globalLevel = 0.5; % Safety dummy value, will not be processed in imbinarize
+isNativelyLogical = islogical(firstImageTest);
+isPseudoBinary = false;
+minVal = 0;
+
+% Checagem de Imagens Pseudo-Binárias (ex: uint8, valores [0, 255])
+if ~isNativelyLogical
+    valores_unicos = unique(firstImageTest(:));
+    if numel(valores_unicos) <= 2
+        isPseudoBinary = true;
+        minVal = min(valores_unicos);
+        fprintf('Pseudo-binary images detected. Bypassing Otsu calculation.\n');
+    end
+end
+
+% Cálculo Global Otsu (se for realmente escala de cinza)
+if isNativelyLogical || isPseudoBinary
+    globalLevel = 0.5; % Dummy value, não será usado.
 elseif binThreshold == -1
-    % Read samples distributed across the volume instead of all slices to save I/O and RAM
+    fprintf('Grayscale images detected. Computing global Otsu threshold via sampling...\n');
     numSamples = min(numImgs, 25); 
     sampleIndices = round(linspace(1, numImgs, numSamples));
     samplePixels = cell(numSamples, 1);
     
-    % Define a reference data class based on the first sample to prevent cell2mat errors
-    I_ref = imread([imgDir files(imgsRange(sampleIndices(1))).name]);
-    if ndims(I_ref) == 3
-        I_ref = rgb2gray(I_ref);
-    end
-    refClass = class(I_ref);
+    refClass = class(firstImageTest);
     
     for s = 1:numSamples
         idxFile = imgsRange(sampleIndices(s));
         I = imread([imgDir files(idxFile).name]);
-        if ndims(I) == 3
-            I = rgb2gray(I);
-        end
+        if ndims(I) == 3, I = rgb2gray(I); end
         I = I(rowsRange, colsRange);
         
-        % Force data type consistency before appending to cell array
         if ~isa(I, refClass)
             I = cast(I, refClass);
         end
-        
         samplePixels{s} = I(:); 
     end
     
     sampledVol = cell2mat(samplePixels);
     globalLevel = graythresh(sampledVol);
+    fprintf('Otsu global threshold set to: %.4f\n', globalLevel);
 else
     globalLevel = binThreshold;
 end
 
 % -------------------- Single-Pass Read and Binarize ----------------------
-% Pre-allocate purely logical matrix.
 C = false(numRows, numCols, numImgs);
 
 if useParallel
     parfor ii = 1:numImgs
         idxFile = imgsRange(ii);
         I = imread([imgDir files(idxFile).name]);
-        if ndims(I) == 3
-            I = rgb2gray(I);
-        end
+        if ndims(I) == 3, I = rgb2gray(I); end
         I = I(rowsRange, colsRange);
         
-        % Direct assignment if already binary; otherwise, binarize
-        if islogical(I)
+        % Nova Lógica de Atribuição Inteligente e Legada
+        if isNativelyLogical
             C(:, :, ii) = I;
+        elseif isPseudoBinary
+            C(:, :, ii) = (I ~= minVal);
         else
-            C(:, :, ii) = imbinarize(I, globalLevel);
+            if isLegacy
+                C(:, :, ii) = im2bw(I, globalLevel);
+            else
+                C(:, :, ii) = imbinarize(I, globalLevel);
+            end
         end
     end
 else
     for ii = 1:numImgs
         idxFile = imgsRange(ii);
         I = imread([imgDir files(idxFile).name]);
-        if ndims(I) == 3
-            I = rgb2gray(I);
-        end
+        if ndims(I) == 3, I = rgb2gray(I); end
         I = I(rowsRange, colsRange);
         
-        if islogical(I)
+        % Nova Lógica de Atribuição Inteligente e Legada
+        if isNativelyLogical
             C(:, :, ii) = I;
+        elseif isPseudoBinary
+            C(:, :, ii) = (I ~= minVal);
         else
-            C(:, :, ii) = imbinarize(I, globalLevel);
+            if isLegacy
+                C(:, :, ii) = im2bw(I, globalLevel);
+            else
+                C(:, :, ii) = imbinarize(I, globalLevel);
+            end
         end
     end
 end
